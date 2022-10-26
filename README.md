@@ -1,7 +1,11 @@
 # CoaT
-# This repo is implement Coat using MindSpore
+This repo is implement Coat using MindSpore
 
-Finish：
-model.py源码中引入einops库中的rearrange算子，该算子不支持mindspore的tensor相关操作。
+# Finish：
+train.py正在训练
 
-To do：
+# To do：
+1、model.train 方式训练
+
+2、pynative+混合编程训练
+
