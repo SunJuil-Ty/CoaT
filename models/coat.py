@@ -2,21 +2,19 @@
 CoaT architecture.
 Modified from timm/models/vision_transformer.py
 """
-import collections.abc
+
 import numpy as np
-from itertools import repeat
 
 import mindspore
 import mindspore.nn as nn
 import mindspore.ops as ops
 import mindspore.common.initializer as init
-from mindspore.numpy import empty
+from mindspore.numpy import empty, split
 from mindspore import Tensor
 from mindspore import ms_function
 
 from .registry import register_model
 from .utils import load_pretrained
-
 
 
 IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
@@ -39,6 +37,9 @@ def _cfg(url='', **kwargs):
         'url': url,
         'num_classes': 1000,
         'input_size': (3, 224, 224),
+        'pool_size': None,
+        'crop_pct': .9,
+        'interpolation': 'bicubic',
         'mean': IMAGENET_DEFAULT_MEAN, 'std': IMAGENET_DEFAULT_STD,
         'first_conv': 'patch_embed.proj', 'classifier': 'head',
         **kwargs
@@ -54,18 +55,6 @@ default_cfgs = {
     'coat_lite_small': _cfg(url=''),
     'coat_lite_medium':_cfg(url="")
 }
-
-
-def _ntuple(n):
-    def parse(x):
-        if isinstance(x, collections.abc.Iterable):
-            return x
-        return tuple(repeat(x, n))
-
-    return parse
-
-
-to_2tuple = _ntuple(2)
 
 
 class Identity(nn.Cell):
@@ -116,23 +105,21 @@ class Mlp(nn.Cell):
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
         self.fc1 = nn.Dense(in_channels=in_features, out_channels=hidden_features, has_bias=True)
-        self.act = nn.GELU()
+        self.act = nn.GELU(approximate=False)
         self.fc2 = nn.Dense(in_channels=hidden_features, out_channels=out_features, has_bias=True)
         self.drop = nn.Dropout(keep_prob=1.0 - drop)
 
     def construct(self, x):
-        print(x)
-        print("----------")
         x = self.fc1(x)
         x = self.act(x)
         x = self.drop(x)
         x = self.fc2(x)
         x = self.drop(x)
+        
         return x
 
 
 class ConvRelPosEnc(nn.Cell):
-    """ Convolutional relative position encoding. """
 
     def __init__(self, Ch, h, window):
         super().__init__()
@@ -159,28 +146,17 @@ class ConvRelPosEnc(nn.Cell):
                                  group=cur_head_split * Ch,
                                  pad_mode='pad',
                                  has_bias=True,
-                                 weight_init="TruncatedNormal"
+                                 weight_init="HeUniform",
+                                 bias_init="Uniform"
                                  )
             self.conv_list.append(cur_conv)
             self.head_splits.append(cur_head_split)
             self.length = self.length + 1
         self.channel_splits = [x * Ch for x in self.head_splits]
 
-    def splt(self, img):
-        length = self.length
-
-        img_list = [img[:, :self.channel_splits[0], :, :]]
-        for n in range(1, length - 1):
-            img_list.append(img[:, sum(self.channel_splits[:n]):sum(self.channel_splits[:n + 1]), :, :])
-        img_list.append(img[:, sum(self.channel_splits[:length - 1]):, :, :])
-
-        return img_list
-
+    @ms_function()
     def construct(self, q, v, size):
-        # print(q.shape)
-        # print(v.shape)
-        # print(size)
-        # print("---------")
+
         B, h, N, Ch = q.shape
         H, W = size
 
@@ -188,11 +164,15 @@ class ConvRelPosEnc(nn.Cell):
         v_img = v[:, :, 1:, :]
 
         v_img = v_img.transpose((0, 1, 3, 2)).reshape((B, h * Ch, H, W))
-        v_img_list = self.splt(v_img)
-        #conv_v_img_list = [conv(x) for conv, x in zip(self.conv_list, v_img_list)]
+
+        channel_split = self.channel_splits
+        v_img_list = split(x=v_img, indices_or_sections=[channel_split[0], channel_split[0]+channel_split[1]], axis=1)
+
         conv_v_img_list = []
-        for i, conv in enumerate(self.conv_list):
+        i = 0
+        for conv in self.conv_list:
             conv_v_img_list.append(conv(v_img_list[i]))
+            i = i + 1
         conv_v_img = ops.concat(conv_v_img_list, axis=1)
         conv_v_img = conv_v_img.reshape((B, h, Ch, H * W)).transpose((0, 1, 3, 2))
 
@@ -262,7 +242,8 @@ class ConvPosEnc(nn.Cell):
                               group=dim,
                               pad_mode='pad',
                               has_bias=True,
-                              weight_init="TruncatedNormal"
+                              weight_init="HeUniform",
+                              bias_init="Uniform"
                               )
 
     def construct(self, x, size):
@@ -311,6 +292,7 @@ class SerialBlock(nn.Cell):
                                                       shared_crpe=shared_crpe
                                                       )
         self.drop_path = DropPath(drop_path) if drop_path > 0. else Identity()
+        
 
         self.norm2 = nn.LayerNorm((dim,), epsilon=1e-6)
         mlp_hidden_dim = int(dim * mlp_ratio)
@@ -460,7 +442,8 @@ class PatchEmbed(nn.Cell):
                               stride=patch_size,
                               pad_mode='pad',
                               has_bias=True,
-                              weight_init="TruncatedNormal"
+                              weight_init="HeUniform",
+                              bias_init="Uniform"
                               )
 
         self.norm = nn.LayerNorm((embed_dim,), epsilon=1e-5)
@@ -587,7 +570,13 @@ class CoaT(nn.Cell):
             self.norm4 = nn.LayerNorm((embed_dims[3],), epsilon=1e-6)
 
             if self.parallel_depth > 0:
-                self.aggregate = nn.Conv1d(in_channels=3, out_channels=1, kernel_size=1, has_bias=True)    #may problem
+                self.aggregate = nn.Conv1d(in_channels=3,
+                                           out_channels=1,
+                                           kernel_size=1,
+                                           has_bias=True,
+                                           weight_init="HeUniform",
+                                           bias_init="Uniform"
+                                           )    #may problem
                 self.head = nn.Dense(embed_dims[3], num_classes) if num_classes > 0 else Identity()
             else:
                 self.aggregate = None
@@ -614,14 +603,13 @@ class CoaT(nn.Cell):
                 cell.beta.set_data(init.initializer(init.Constant(0), cell.beta.shape))
 
     def insert_cls(self, x, cls_token):
-        # print("x:", x.shape)
-        # print("cls_token:", cls_token.shape)
-        # print("target:", (x.shape[0], -1, -1))
-        #
-        y = Tensor(np.ones((x.shape[0], cls_token.shape[1], cls_token.shape[2])))
+
+        t0 = x.shape[0]
+        t1 = cls_token.shape[1]
+        t2 = cls_token.shape[2]
+        y = Tensor(np.ones((t0, t1, t2)))
         cls_tokens = cls_token.expand_as(y)
-        # print("cls_tokens:", cls_tokens.shape)
-        # print("----------------")
+
         x = ops.concat((cls_tokens, x), axis=1)
         return x
 
@@ -717,11 +705,20 @@ class CoaT(nn.Cell):
             return merged_cls
 
     def construct(self, x):
+        #print("="*20)
+        #print("coat_input")
+        #print(x)
         if self.return_interm_layers:
+            #print("="*20)
+            #print("coat_output")
+            #print(self.forward_features)
             return self.forward_features(x)
         else:
             x = self.forward_features(x)
             x = self.head(x)
+            #print("="*20)
+            #print("coat_output")
+            #print(x)
             return x
 
 
