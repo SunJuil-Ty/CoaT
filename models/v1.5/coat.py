@@ -96,7 +96,7 @@ class Mlp(nn.Cell):
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
         self.fc1 = nn.Dense(in_channels=in_features, out_channels=hidden_features, has_bias=True)
-        self.act = act_layer()
+        self.act = act_layer(approximate=False)
         self.fc2 = nn.Dense(in_channels=hidden_features, out_channels=out_features, has_bias=True)
         self.drop = nn.Dropout(keep_prob=1.0 - drop)
 
