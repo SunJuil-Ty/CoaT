@@ -3,6 +3,7 @@ CoaT architecture.
 Modified from timm/models/vision_transformer.py
 """
 import numpy as np
+import copy
 
 import mindspore
 import mindspore.nn as nn
@@ -89,14 +90,13 @@ class Mlp(nn.Cell):
                  in_features,
                  hidden_features=None,
                  out_features=None,
-                 act_layer=nn.GELU,
                  drop=0.
                  ):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
         self.fc1 = nn.Dense(in_channels=in_features, out_channels=hidden_features, has_bias=True)
-        self.act = act_layer(approximate=False)
+        self.act = nn.GELU(approximate=False)
         self.fc2 = nn.Dense(in_channels=hidden_features, out_channels=out_features, has_bias=True)
         self.drop = nn.Dropout(keep_prob=1.0 - drop)
 
@@ -156,7 +156,6 @@ class ConvRelPosEnc(nn.Cell):
 
     @ms_function
     def construct(self, q, v, size):
-
         B, h, N, Ch = q.shape
         H, W = size
 
@@ -166,23 +165,18 @@ class ConvRelPosEnc(nn.Cell):
 
         v_img = ops.transpose(v_img, (0, 1, 3, 2))
         v_img = ops.reshape(v_img, (B, h * Ch, H, W))
-
         v_img_list = split(x=v_img, indices_or_sections=[self.idx1, self.idx2], axis=1)
         conv_v_img_list = []
         i = 0
         for conv in self.conv_list:
             conv_v_img_list.append(conv(v_img_list[i]))
             i = i + 1
-
         conv_v_img = ops.concat(conv_v_img_list, axis=1)
-
         conv_v_img = ops.reshape(conv_v_img, (B, h, Ch, H * W))
         conv_v_img = ops.transpose(conv_v_img, (0, 1, 3, 2))
 
         EV_hat_img = q_img * conv_v_img
         zero = ops.Zeros()((B, h, 1, Ch), q.dtype)
-
-        EV_hat_img = ops.cast(EV_hat_img, mindspore.float32)
         EV_hat = ops.concat((zero, EV_hat_img), axis=2)
 
         return EV_hat
@@ -195,14 +189,13 @@ class FactorAtt_ConvRelPosEnc(nn.Cell):
                  dim,
                  num_heads=8,
                  qkv_bias=False,
-                 qk_scale=None,
                  attn_drop=0.,
                  proj_drop=0.,
                  shared_crpe=None):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
-        self.scale = qk_scale or head_dim ** -0.5
+        self.scale = head_dim ** -0.5
 
         self.qkv = nn.Dense(dim, dim * 3, has_bias=qkv_bias)
         self.attn_drop = nn.Dropout(keep_prob=1 - attn_drop)
@@ -212,7 +205,6 @@ class FactorAtt_ConvRelPosEnc(nn.Cell):
         # Shared convolutional relative position encoding.
         self.crpe = shared_crpe
 
-        # self.unstack = ops.Unstack(axis=0)
         self.softmax = nn.Softmax(axis=2)
 
     def construct(self, x, size):
@@ -222,8 +214,8 @@ class FactorAtt_ConvRelPosEnc(nn.Cell):
         qkv = self.qkv(x)
         qkv = ops.reshape(qkv, (B, N, 3, self.num_heads, C // self.num_heads))
         qkv = ops.transpose(qkv, (2, 0, 3, 1, 4))
-        q, k, v = ops.Unstack(axis=0)(qkv)
-        #q, k, v = qkv[0], qkv[1], qkv[2]
+        # q, k, v = ops.Unstack(axis=0)(qkv)
+        q, k, v = qkv[0], qkv[1], qkv[2]
 
         # Factorized attention.
         k_softmax = self.softmax(k)
@@ -277,15 +269,13 @@ class ConvPosEnc(nn.Cell):
         # Depthwise convolution.
         feat = ops.transpose(img_tokens, (0, 2, 1))
         feat = ops.reshape(feat, (B, C, H, W))
-        # x = ops.add(self.proj(feat), feat)
-        x = self.proj(feat) + feat
+        x = ops.add(self.proj(feat), feat)
+        # x = self.proj(feat) + feat
 
         x = ops.reshape(x, (B, C, H * W))
         x = ops.transpose(x, (0, 2, 1))
 
         # Combine with CLS token.
-        x = ops.cast(x, mindspore.float32)
-        cls_token = ops.cast(cls_token, mindspore.float32)
         x = ops.concat((cls_token, x), axis=1)
 
         return x
@@ -301,11 +291,9 @@ class SerialBlock(nn.Cell):
                  num_heads,
                  mlp_ratio=4.,
                  qkv_bias=False,
-                 qk_scale=None,
                  drop=0.,
                  attn_drop=0.,
                  drop_path=0.,
-                 act_layer=nn.GELU,
                  shared_cpe=None,
                  shared_crpe=None):
         super().__init__()
@@ -316,7 +304,6 @@ class SerialBlock(nn.Cell):
         self.factoratt_crpe = FactorAtt_ConvRelPosEnc(dim,
                                                       num_heads=num_heads,
                                                       qkv_bias=qkv_bias,
-                                                      qk_scale=qk_scale,
                                                       attn_drop=attn_drop,
                                                       proj_drop=drop,
                                                       shared_crpe=shared_crpe
@@ -325,7 +312,7 @@ class SerialBlock(nn.Cell):
 
         self.norm2 = nn.LayerNorm((dim,), epsilon=1e-6)
         mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, drop=drop)
 
     def construct(self, x, size):
         # Conv-Attention.
@@ -351,11 +338,9 @@ class ParallelBlock(nn.Cell):
                  num_heads,
                  mlp_ratios=[],
                  qkv_bias=False,
-                 qk_scale=None,
                  drop=0.,
                  attn_drop=0.,
                  drop_path=0.,
-                 act_layer=nn.GELU,
                  shared_cpes=None,
                  shared_crpes=None):
         super().__init__()
@@ -368,7 +353,6 @@ class ParallelBlock(nn.Cell):
         self.factoratt_crpe2 = FactorAtt_ConvRelPosEnc(dims[1],
                                                        num_heads=num_heads,
                                                        qkv_bias=qkv_bias,
-                                                       qk_scale=qk_scale,
                                                        attn_drop=attn_drop,
                                                        proj_drop=drop,
                                                        shared_crpe=shared_crpes[1]
@@ -376,7 +360,6 @@ class ParallelBlock(nn.Cell):
         self.factoratt_crpe3 = FactorAtt_ConvRelPosEnc(dims[2],
                                                        num_heads=num_heads,
                                                        qkv_bias=qkv_bias,
-                                                       qk_scale=qk_scale,
                                                        attn_drop=attn_drop,
                                                        proj_drop=drop,
                                                        shared_crpe=shared_crpes[2]
@@ -384,7 +367,6 @@ class ParallelBlock(nn.Cell):
         self.factoratt_crpe4 = FactorAtt_ConvRelPosEnc(dims[3],
                                                        num_heads=num_heads,
                                                        qkv_bias=qkv_bias,
-                                                       qk_scale=qk_scale,
                                                        attn_drop=attn_drop,
                                                        proj_drop=drop,
                                                        shared_crpe=shared_crpes[3]
@@ -396,7 +378,7 @@ class ParallelBlock(nn.Cell):
         self.norm24 = nn.LayerNorm((dims[3],), epsilon=1e-6)
 
         mlp_hidden_dim = int(dims[1] * mlp_ratios[1])
-        self.mlp2 = self.mlp3 = self.mlp4 = Mlp(in_features=dims[1], hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+        self.mlp2 = self.mlp3 = self.mlp4 = Mlp(in_features=dims[1], hidden_features=mlp_hidden_dim, drop=drop)
 
     def upsample(self, x, output_size, size):
         """ Feature map up-sampling. """
@@ -424,8 +406,6 @@ class ParallelBlock(nn.Cell):
         img_tokens = ops.reshape(img_tokens, (B, C, -1))
         img_tokens = ops.transpose(img_tokens, (0, 2, 1))
 
-        cls_token = ops.Cast()(cls_token, mindspore.float32)
-        img_tokens = ops.Cast()(img_tokens, mindspore.float32)
         out = ops.concat((cls_token, img_tokens), axis=1)
 
         return out
@@ -492,7 +472,7 @@ class PatchEmbed(nn.Cell):
                               out_channels=embed_dim,
                               kernel_size=patch_size,
                               stride=patch_size,
-                              pad_mode='pad',
+                              pad_mode='valid',
                               has_bias=True
                               # weight_init="HeUniform"
                               # bias_init="Uniform"
@@ -524,7 +504,6 @@ class CoaT(nn.Cell):
                  num_heads=0,
                  mlp_ratios=[0, 0, 0, 0],
                  qkv_bias=True,
-                 qk_scale=None,
                  drop_rate=0.,
                  attn_drop_rate=0.,
                  drop_path_rate=0.,
@@ -567,7 +546,7 @@ class CoaT(nn.Cell):
         # Serial blocks 1.
         self.serial_blocks1 = nn.CellList([
             SerialBlock(
-                dim=embed_dims[0], num_heads=num_heads, mlp_ratio=mlp_ratios[0], qkv_bias=qkv_bias, qk_scale=qk_scale,
+                dim=embed_dims[0], num_heads=num_heads, mlp_ratio=mlp_ratios[0], qkv_bias=qkv_bias,
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr,
                 shared_cpe=self.cpe1, shared_crpe=self.crpe1
             )
@@ -577,7 +556,7 @@ class CoaT(nn.Cell):
         # Serial blocks 2.
         self.serial_blocks2 = nn.CellList([
             SerialBlock(
-                dim=embed_dims[1], num_heads=num_heads, mlp_ratio=mlp_ratios[1], qkv_bias=qkv_bias, qk_scale=qk_scale,
+                dim=embed_dims[1], num_heads=num_heads, mlp_ratio=mlp_ratios[1], qkv_bias=qkv_bias,
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr,
                 shared_cpe=self.cpe2, shared_crpe=self.crpe2
             )
@@ -587,7 +566,7 @@ class CoaT(nn.Cell):
         # Serial blocks 3.
         self.serial_blocks3 = nn.CellList([
             SerialBlock(
-                dim=embed_dims[2], num_heads=num_heads, mlp_ratio=mlp_ratios[2], qkv_bias=qkv_bias, qk_scale=qk_scale,
+                dim=embed_dims[2], num_heads=num_heads, mlp_ratio=mlp_ratios[2], qkv_bias=qkv_bias,
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr,
                 shared_cpe=self.cpe3, shared_crpe=self.crpe3
             )
@@ -597,7 +576,7 @@ class CoaT(nn.Cell):
         # Serial blocks 4.
         self.serial_blocks4 = nn.CellList([
             SerialBlock(
-                dim=embed_dims[3], num_heads=num_heads, mlp_ratio=mlp_ratios[3], qkv_bias=qkv_bias, qk_scale=qk_scale,
+                dim=embed_dims[3], num_heads=num_heads, mlp_ratio=mlp_ratios[3], qkv_bias=qkv_bias,
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr,
                 shared_cpe=self.cpe4, shared_crpe=self.crpe4
             )
@@ -612,7 +591,6 @@ class CoaT(nn.Cell):
                               num_heads=num_heads,
                               mlp_ratios=mlp_ratios,
                               qkv_bias=qkv_bias,
-                              qk_scale=qk_scale,
                               drop=drop_rate,
                               attn_drop=attn_drop_rate,
                               drop_path=dpr,
@@ -634,6 +612,7 @@ class CoaT(nn.Cell):
                 self.aggregate = nn.Conv1d(in_channels=3,
                                            out_channels=1,
                                            kernel_size=1,
+                                           pad_mode='valid',
                                            has_bias=True
                                            # weight_init="HeUniform",
                                            # bias_init="Uniform"
@@ -665,10 +644,8 @@ class CoaT(nn.Cell):
         t1 = cls_token.shape[1]
         t2 = cls_token.shape[2]
         y = Tensor(np.ones((t0, t1, t2)))
+        # y = Tensor(np.ones((x.shape[0], cls_token.shape[1], cls_token.shape[2])))
         cls_tokens = cls_token.expand_as(y)
-
-        x = ops.Cast()(x, mindspore.float32)
-        cls_tokens = ops.Cast()(cls_tokens, mindspore.float32)
         x = ops.concat((cls_tokens, x), axis=1)
         return x
 
@@ -678,6 +655,7 @@ class CoaT(nn.Cell):
     def forward_features(self, x0):
         B = x0.shape[0]
 
+        # Serial blocks 1.
         x1 = self.patch_embed1(x0)
         H1, W1 = self.patch_embed1.patches_resolution
         x1 = self.insert_cls(x1, self.cls_token1)
@@ -689,6 +667,7 @@ class CoaT(nn.Cell):
         x1_nocls = ops.reshape(x1_nocls, (B, H1, W1, -1))
         x1_nocls = ops.transpose(x1_nocls, (0, 3, 1, 2))
 
+        # Serial blocks 2.
         x2 = self.patch_embed2(x1_nocls)
         H2, W2 = self.patch_embed2.patches_resolution
         x2 = self.insert_cls(x2, self.cls_token2)
@@ -700,6 +679,7 @@ class CoaT(nn.Cell):
         x2_nocls = ops.reshape(x2_nocls, (B, H2, W2, -1))
         x2_nocls = ops.transpose(x2_nocls, (0, 3, 1, 2))
 
+        # Serial blocks 3.
         x3 = self.patch_embed3(x2_nocls)
         H3, W3 = self.patch_embed3.patches_resolution
         x3 = self.insert_cls(x3, self.cls_token3)
@@ -711,6 +691,7 @@ class CoaT(nn.Cell):
         x3_nocls = ops.reshape(x3_nocls, (B, H3, W3, -1))
         x3_nocls = ops.transpose(x3_nocls, (0, 3, 1, 2))
 
+        # Serial blocks 4.
         x4 = self.patch_embed4(x3_nocls)
         H4, W4 = self.patch_embed4.patches_resolution
         x4 = self.insert_cls(x4, self.cls_token4)
@@ -769,9 +750,6 @@ class CoaT(nn.Cell):
             x2_cls = x2[:, :1]
             x3_cls = x3[:, :1]
             x4_cls = x4[:, :1]
-            x2_cls = ops.Cast()(x2_cls, mindspore.float32)
-            x3_cls = ops.Cast()(x3_cls, mindspore.float32)
-            x4_cls = ops.Cast()(x4_cls, mindspore.float32)
             merged_cls = ops.concat((x2_cls, x3_cls, x4_cls), axis=1)
             merged_cls = self.aggregate(merged_cls).squeeze(axis=1)
             return merged_cls
